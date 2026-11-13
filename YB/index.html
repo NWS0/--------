@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#121214">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="description" content="考試、作業與每日練習中控面板。">
+    <title>學業中控台</title>
+    <link rel="manifest" href="./manifest.json">
+    <link rel="icon" href="./icon-192.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="./icon-192.svg">
+    <link rel="stylesheet" href="./style.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.11.1/styles/github-dark.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/marked@15.0.7/marked.min.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js" defer></script>
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="header-meta">
+          <time id="date-label">—</time>
+        </div>
+        <div class="header-meta">
+          <span class="open-count"><span id="open-task-count">0</span> 項未完成</span>
+        </div>
+      </header>
+
+      <main>
+        <section class="workspace is-active" id="dashboard" aria-labelledby="dashboard-title">
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">OVERVIEW</p>
+              <h1 id="dashboard-title">任務儀表板</h1>
+            </div>
+            <button class="add-button" id="open-task-modal" type="button"><span aria-hidden="true">＋</span> 新增項目</button>
+          </div>
+
+          <div class="task-columns">
+            <section class="task-section exam-section" aria-labelledby="exams-title">
+              <div class="section-title">
+                <span class="category-dot exam-dot" aria-hidden="true"></span>
+                <h2 id="exams-title">考試日程</h2>
+                <span class="section-count" id="exam-count">0</span>
+              </div>
+              <div class="task-list" id="exam-list" aria-live="polite"></div>
+            </section>
+
+            <section class="task-section homework-section" aria-labelledby="homework-title">
+              <div class="section-title">
+                <span class="category-dot homework-dot" aria-hidden="true"></span>
+                <h2 id="homework-title">學校作業</h2>
+                <span class="section-count" id="homework-count">0</span>
+              </div>
+              <div class="task-list" id="homework-list" aria-live="polite"></div>
+            </section>
+
+            <section class="task-section daily-section" aria-labelledby="daily-title">
+              <div class="section-title daily-heading">
+                <div class="section-title-main">
+                  <span class="category-dot daily-dot" aria-hidden="true"></span>
+                  <h2 id="daily-title">每日練習</h2>
+                  <span class="section-count" id="daily-count">0</span>
+                </div>
+                <span class="daily-progress-label" id="daily-progress-label">0 / 0 完成</span>
+              </div>
+              <div class="progress-track" aria-hidden="true"><span id="daily-progress"></span></div>
+              <div class="task-list" id="daily-list" aria-live="polite"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="workspace" id="portals" aria-labelledby="portals-title" hidden>
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">RESOURCES</p>
+              <h1 id="portals-title">常用傳送門</h1>
+            </div>
+          </div>
+          <form class="panel-card bookmark-form" id="bookmark-form">
+            <input id="bookmark-name" name="name" type="text" maxlength="40" placeholder="名稱，例如：學習歷程" aria-label="捷徑名稱" required>
+            <input id="bookmark-url" name="url" type="url" maxlength="500" placeholder="https://…" aria-label="捷徑網址" required>
+            <button class="small-button" type="submit">新增連結</button>
+          </form>
+          <div class="bookmark-grid" id="bookmark-grid"></div>
+        </section>
+
+        <section class="workspace" id="assistant" aria-labelledby="assistant-title" hidden>
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">STUDY ASSISTANT</p>
+              <h1 id="assistant-title">AI 隨身助教</h1>
+            </div>
+            <button class="text-button chat-clear" id="clear-chat" type="button">清除對話</button>
+          </div>
+          <div class="quick-prompts" aria-label="快捷指令">
+            <button class="prompt-chip" type="button" data-prompt="請幫我 Debug 以下程式碼。指出問題原因、修正方式，並提供修正後的程式碼：&#10;&#10;">幫我 Debug 程式碼</button>
+            <button class="prompt-chip" type="button" data-prompt="請用直白、循序漸進的方式解釋這個觀念，搭配簡單例子：&#10;&#10;">直白解釋觀念</button>
+            <button class="prompt-chip" type="button" data-prompt="請將以下內容整理成適合 Obsidian 的 Markdown 筆記。請使用清楚標題、重點條列與必要的公式：&#10;&#10;">整理成 Obsidian 筆記</button>
+          </div>
+          <section class="chat-panel" aria-label="AI 對話">
+            <div class="chat-messages" id="chat-messages" aria-live="polite"></div>
+            <form class="chat-form" id="chat-form">
+              <label class="visually-hidden" for="chat-input">輸入訊息</label>
+              <textarea id="chat-input" rows="3" maxlength="12000" placeholder="輸入問題…（Enter 送出，Shift+Enter 換行）"></textarea>
+              <div class="chat-form-footer">
+                <span id="chat-status">先到「設定」填入 AI 連線資訊</span>
+                <button class="add-button" id="chat-send" type="submit">送出 <span aria-hidden="true">↗</span></button>
+              </div>
+            </form>
+          </section>
+        </section>
+
+        <section class="workspace" id="schedule" aria-labelledby="schedule-title" hidden>
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">WEEKLY PLAN</p>
+              <h1 id="schedule-title">課表與書包</h1>
+            </div>
+            <label class="upload-button" for="timetable-image">AI 掃描課表</label>
+            <input class="visually-hidden" id="timetable-image" type="file" accept="image/*" capture="environment">
+          </div>
+          <p class="scan-status" id="scan-status" role="status">使用設定中的視覺模型解析圖片；掃描結果可直接修正。</p>
+          <div class="panel-card table-panel">
+            <div class="table-scroll">
+              <table class="timetable" aria-label="週一至週五第 1 至 8 節課表">
+                <thead><tr><th scope="col">節次</th><th scope="col">週一</th><th scope="col">週二</th><th scope="col">週三</th><th scope="col">週四</th><th scope="col">週五</th></tr></thead>
+                <tbody id="timetable-body"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <section class="panel-card binding-card" aria-labelledby="binding-title">
+            <div class="subsection-heading">
+              <div><h2 id="binding-title">科目與講義</h2><p>書籍／講義以逗號分隔</p></div>
+              <form class="subject-form" id="subject-form">
+                <input id="subject-name" type="text" maxlength="24" placeholder="新增科目" aria-label="新增科目名稱" required>
+                <button class="small-button" type="submit">加入</button>
+              </form>
+            </div>
+            <div class="binding-grid" id="binding-grid"></div>
+          </section>
+
+          <section class="panel-card packing-card" aria-labelledby="packing-title">
+            <div class="subsection-heading">
+              <div><h2 id="packing-title">書包清單</h2><p id="notification-status">依今天或明天的課表彙整講義</p><p class="notification-limit">提醒需保持此頁開啟；瀏覽器關閉或裝置休眠時無法準時檢查。</p></div>
+              <button class="small-button" id="notification-button" type="button">啟用提醒</button>
+            </div>
+            <div class="packing-toolbar">
+              <div class="segmented-control" role="group" aria-label="選擇課表日期">
+                <button class="filter-button is-selected" type="button" data-pack-day="today">今天</button>
+                <button class="filter-button" type="button" data-pack-day="tomorrow">明天</button>
+              </div>
+              <label class="time-setting">提醒時間 <input id="packing-time" type="time" value="21:30"></label>
+            </div>
+            <div class="packing-list" id="packing-list" aria-live="polite"></div>
+          </section>
+        </section>
+
+        <section class="workspace" id="settings" aria-labelledby="settings-title" hidden>
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">CONNECTIONS</p>
+              <h1 id="settings-title">設定</h1>
+            </div>
+          </div>
+          <form class="panel-card settings-form" id="ai-settings-form">
+            <div class="settings-section-heading">
+              <div><h2>AI 連線</h2><p>支援 OpenAI 相容 API、Ollama 與 Gemini</p></div>
+              <span class="connection-indicator" id="ai-connection-state">未設定</span>
+            </div>
+            <label class="field-label" for="ai-provider">介面類型
+              <select id="ai-provider" name="provider">
+                <option value="openai">OpenAI 相容介面（SiliconFlow 等）</option>
+                <option value="ollama">Ollama 原生 API</option>
+                <option value="gemini">Google Gemini API</option>
+              </select>
+            </label>
+            <label class="field-label" for="ai-base-url">API Base URL
+              <input id="ai-base-url" name="baseUrl" type="url" inputmode="url" placeholder="https://api.siliconflow.cn/v1" autocomplete="url">
+            </label>
+            <label class="field-label" for="ai-api-key">API Key（Ollama 可留空）
+              <input id="ai-api-key" name="apiKey" type="password" autocomplete="off" placeholder="輸入 API Key">
+            </label>
+            <div class="form-grid">
+              <label class="field-label" for="ai-text-model">文字模型
+                <input id="ai-text-model" name="textModel" type="text" maxlength="120" placeholder="例如：deepseek-ai/DeepSeek-V3" required>
+              </label>
+              <label class="field-label" for="ai-vision-model">視覺模型
+                <input id="ai-vision-model" name="visionModel" type="text" maxlength="120" placeholder="例如：Qwen2.5-VL-7B-Instruct" required>
+              </label>
+            </div>
+            <div class="settings-actions">
+              <button class="text-button" id="clear-ai-key" type="button">清除金鑰</button>
+              <button class="add-button" type="submit">儲存連線</button>
+            </div>
+            <p class="security-note">設定只存在此瀏覽器的 localStorage；API Key 未加密。對話與課表圖片會直接傳送至你填寫的 API，請勿在共用或公開裝置輸入敏感資料。連線需要 API 允許瀏覽器 CORS。</p>
+          </form>
+        </section>
+      </main>
+
+      <nav class="bottom-nav" aria-label="主要導覽">
+        <button class="nav-item is-active" type="button" aria-current="page" data-workspace="dashboard">
+          <span class="nav-icon" aria-hidden="true">▤</span><span>任務儀表板</span>
+        </button>
+        <button class="nav-item" type="button" data-workspace="portals">
+          <span class="nav-icon" aria-hidden="true">↗</span><span>常用傳送門</span>
+        </button>
+        <button class="nav-item" type="button" data-workspace="assistant">
+          <span class="nav-icon" aria-hidden="true">⌁</span><span>AI 助教</span>
+        </button>
+        <button class="nav-item" type="button" data-workspace="schedule">
+          <span class="nav-icon" aria-hidden="true">▦</span><span>課表與書包</span>
+        </button>
+        <button class="nav-item" type="button" data-workspace="settings">
+          <span class="nav-icon" aria-hidden="true">⚙</span><span>設定</span>
+        </button>
+      </nav>
+    </div>
+
+    <dialog class="task-dialog" id="task-dialog" aria-labelledby="task-dialog-title">
+      <form class="dialog-form" id="task-form">
+        <div class="dialog-heading">
+          <div><p class="eyebrow">TASK EDITOR</p><h2 id="task-dialog-title">新增項目</h2></div>
+          <button class="close-button" id="close-task-modal" type="button" aria-label="關閉">×</button>
+        </div>
+        <input id="task-id" name="id" type="hidden">
+        <label class="field-label" for="task-type">分類
+          <select id="task-type" name="type">
+            <option value="exam">考試日程</option>
+            <option value="homework">學校作業</option>
+            <option value="practice">每日練習</option>
+          </select>
+        </label>
+        <label class="field-label" for="task-title">名稱
+          <input id="task-title" name="title" type="text" maxlength="80" placeholder="輸入名稱" required>
+        </label>
+        <label class="field-label" for="task-subject">科目
+          <input id="task-subject" name="subject" type="text" maxlength="40" placeholder="例如：數學">
+        </label>
+        <label class="field-label hidden" id="task-scope-field" for="task-scope">考試範圍
+          <input id="task-scope" name="scope" type="text" maxlength="100" placeholder="例如：第三章至第五章">
+        </label>
+        <div class="form-grid">
+          <label class="field-label" id="task-date-field" for="task-date">日期
+            <input id="task-date" name="date" type="date">
+          </label>
+          <label class="field-label hidden" id="task-time-field" for="task-time">繳交時間
+            <input id="task-time" name="time" type="time">
+          </label>
+        </div>
+        <label class="field-label hidden" id="task-goal-field" for="task-goal">每日目標
+          <input id="task-goal" name="goal" type="text" maxlength="60" placeholder="例如：講義 p.12–16">
+        </label>
+        <div class="dialog-actions">
+          <button class="text-button" id="cancel-task-modal" type="button">取消</button>
+          <button class="add-button" type="submit">儲存項目</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>
