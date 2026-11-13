@@ -1217,6 +1217,58 @@ document.querySelector("#clear-chat").addEventListener("click", () => {
   showToast("對話紀錄已清除。");
 });
 
+const menuToggle = document.querySelector("#menu-toggle");
+const drawer = document.querySelector("#nav-drawer");
+const drawerBackdrop = document.querySelector("#drawer-backdrop");
+const drawerControls = [
+  document.querySelector("#close-drawer"),
+  ...drawer.querySelectorAll(".nav-item")
+];
+
+function setDrawerOpen(open, restoreFocus = true) {
+  drawer.classList.toggle("is-open", open);
+  drawerBackdrop.classList.toggle("is-open", open);
+  drawer.setAttribute("aria-hidden", String(!open));
+  drawer.setAttribute("aria-modal", String(open));
+  menuToggle.setAttribute("aria-expanded", String(open));
+  menuToggle.setAttribute("aria-label", open ? "關閉導覽選單" : "開啟導覽選單");
+  document.body.classList.toggle("drawer-open", open);
+  drawerControls.forEach((control) => {
+    control.tabIndex = open ? 0 : -1;
+  });
+  if (open) {
+    drawer.querySelector(".nav-item.is-active").focus({ preventScroll: true });
+  } else if (restoreFocus) {
+    menuToggle.focus({ preventScroll: true });
+  }
+}
+
+menuToggle.addEventListener("click", () => {
+  setDrawerOpen(menuToggle.getAttribute("aria-expanded") !== "true");
+});
+document.querySelector("#close-drawer").addEventListener("click", () => setDrawerOpen(false));
+drawerBackdrop.addEventListener("click", () => setDrawerOpen(false));
+document.addEventListener("keydown", (event) => {
+  if (menuToggle.getAttribute("aria-expanded") !== "true") return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    setDrawerOpen(false);
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const focusable = drawerControls.filter((control) => control.tabIndex >= 0);
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+});
+setDrawerOpen(false, false);
+
 document.querySelectorAll("[data-workspace]").forEach((button) => {
   button.addEventListener("click", () => {
     document.querySelectorAll("[data-workspace]").forEach((item) => {
@@ -1229,6 +1281,9 @@ document.querySelectorAll("[data-workspace]").forEach((button) => {
       workspace.hidden = !active;
       workspace.classList.toggle("is-active", active);
     });
+    const workspaceTitle = document.querySelector(`#${button.dataset.workspace}-title`);
+    document.querySelector("#current-page-title").textContent = workspaceTitle.textContent;
+    setDrawerOpen(false);
     window.scrollTo({ top: 0, behavior: "smooth" });
   });
 });

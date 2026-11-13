@@ -21,6 +21,10 @@
   <body>
     <div class="app-shell">
       <header class="topbar">
+        <div class="topbar-leading">
+          <button class="menu-toggle" id="menu-toggle" type="button" aria-label="開啟導覽選單" aria-expanded="false" aria-controls="nav-drawer">☰</button>
+          <span class="current-page-title" id="current-page-title">任務儀表板</span>
+        </div>
         <div class="header-meta">
           <time id="date-label">—</time>
         </div>
@@ -220,24 +224,32 @@
         </section>
       </main>
 
-      <nav class="bottom-nav" aria-label="主要導覽">
+    </div>
+
+    <div class="drawer-backdrop" id="drawer-backdrop" aria-hidden="true"></div>
+    <aside class="sidebar-drawer" id="nav-drawer" role="dialog" aria-modal="false" aria-label="主要導覽" aria-hidden="true">
+      <div class="drawer-header">
+        <span>導覽</span>
+        <button class="drawer-close" id="close-drawer" type="button" aria-label="關閉導覽選單">×</button>
+      </div>
+      <nav class="drawer-nav">
         <button class="nav-item is-active" type="button" aria-current="page" data-workspace="dashboard">
-          <span class="nav-icon" aria-hidden="true">▤</span><span>任務儀表板</span>
+          <span class="nav-icon" aria-hidden="true">▤</span><span class="nav-label">任務儀表板</span>
         </button>
         <button class="nav-item" type="button" data-workspace="portals">
-          <span class="nav-icon" aria-hidden="true">↗</span><span>常用傳送門</span>
+          <span class="nav-icon" aria-hidden="true">↗</span><span class="nav-label">常用傳送門</span>
         </button>
         <button class="nav-item" type="button" data-workspace="assistant">
-          <span class="nav-icon" aria-hidden="true">⌁</span><span>AI 助教</span>
+          <span class="nav-icon" aria-hidden="true">⌁</span><span class="nav-label">AI 助教</span>
         </button>
         <button class="nav-item" type="button" data-workspace="schedule">
-          <span class="nav-icon" aria-hidden="true">▦</span><span>課表與書包</span>
+          <span class="nav-icon" aria-hidden="true">▦</span><span class="nav-label">課表與書包</span>
         </button>
         <button class="nav-item" type="button" data-workspace="settings">
-          <span class="nav-icon" aria-hidden="true">⚙</span><span>設定</span>
+          <span class="nav-icon" aria-hidden="true">⚙</span><span class="nav-label">設定</span>
         </button>
       </nav>
-    </div>
+    </aside>
 
     <dialog class="task-dialog" id="task-dialog" aria-labelledby="task-dialog-title">
       <form class="dialog-form" id="task-form">
