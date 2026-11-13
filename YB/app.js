@@ -1,4 +1,6 @@
 const storageKey = "night-space-state";
+const syncStorageKey = "night-space-github-sync";
+const syncFileName = "yb-study-sync.json";
 const weekdays = ["週一", "週二", "週三", "週四", "週五"];
 const defaultSubjects = ["國文", "英文", "數學", "物理", "化學", "生物", "歷史", "地理", "公民"];
 const taskTypes = { exam: "考試", homework: "作業", practice: "練習" };
@@ -9,25 +11,33 @@ let swRegistration = null;
 let selectedPackingDay = "today";
 let chatRequestInProgress = false;
 let timetableScanInProgress = false;
-let state = {
-  focusMinutes: 0,
-  completedCount: 0,
-  tasks: [],
-  bookmarks: [],
-  timetable: Array.from({ length: 8 }, () => Array(5).fill("")),
-  bindings: {},
-  packingTime: "21:30",
-  packingChecked: {},
-  lastReminderDate: "",
-  aiConfig: { provider: "openai", baseUrl: "", apiKey: "", textModel: "", visionModel: "" },
-  chatMessages: []
-};
+let syncTimer;
+let syncInProgress = false;
+let syncSettings = { token: "", gistId: "", updatedAt: 0, lastSyncedAt: 0 };
+let syncStatus = "未設定";
+let state = createDefaultState();
 
-try {
-  const saved = JSON.parse(localStorage.getItem(storageKey) || "{}");
-  state.focusMinutes = Number.isFinite(saved.focusMinutes) ? saved.focusMinutes : 0;
-  state.completedCount = Number.isFinite(saved.completedCount) ? saved.completedCount : 0;
-  state.tasks = Array.isArray(saved.tasks) ? saved.tasks.map((task) => ({
+function createDefaultState() {
+  return {
+    focusMinutes: 0,
+    completedCount: 0,
+    tasks: [],
+    bookmarks: [],
+    timetable: Array.from({ length: 8 }, () => Array(5).fill("")),
+    bindings: {},
+    packingTime: "21:30",
+    packingChecked: {},
+    lastReminderDate: "",
+    aiConfig: { provider: "openai", baseUrl: "", apiKey: "", textModel: "", visionModel: "" },
+    chatMessages: []
+  };
+}
+
+function normalizeState(saved) {
+  const normalized = createDefaultState();
+  normalized.focusMinutes = Number.isFinite(saved.focusMinutes) ? saved.focusMinutes : 0;
+  normalized.completedCount = Number.isFinite(saved.completedCount) ? saved.completedCount : 0;
+  normalized.tasks = Array.isArray(saved.tasks) ? saved.tasks.map((task) => ({
     ...task,
     type: taskTypes[task.type] ? task.type : "homework",
     subject: typeof task.subject === "string" ? task.subject : "",
@@ -36,37 +46,54 @@ try {
     completed: Boolean(task.completed),
     completedOn: typeof task.completedOn === "string" ? task.completedOn : ""
   })) : [];
-  state.tasks.forEach((task) => {
+  normalized.tasks.forEach((task) => {
     if (task.type === "practice" && task.completed && !task.completedOn) {
       task.completedOn = localDateString(new Date());
       task.completed = false;
     }
   });
-  state.bookmarks = Array.isArray(saved.bookmarks) ? saved.bookmarks : [];
-  state.timetable = Array.from({ length: 8 }, (_, period) =>
+  normalized.bookmarks = Array.isArray(saved.bookmarks) ? saved.bookmarks : [];
+  normalized.timetable = Array.from({ length: 8 }, (_, period) =>
     Array.from({ length: 5 }, (_, day) =>
       typeof saved.timetable?.[period]?.[day] === "string" ? saved.timetable[period][day] : ""
     )
   );
-  state.bindings = saved.bindings && typeof saved.bindings === "object" && !Array.isArray(saved.bindings) ? saved.bindings : {};
-  state.packingTime = /^\d{2}:\d{2}$/.test(saved.packingTime || "") ? saved.packingTime : "21:30";
-  state.packingChecked = saved.packingChecked && typeof saved.packingChecked === "object" ? saved.packingChecked : {};
-  state.lastReminderDate = typeof saved.lastReminderDate === "string" ? saved.lastReminderDate : "";
+  normalized.bindings = saved.bindings && typeof saved.bindings === "object" && !Array.isArray(saved.bindings) ? saved.bindings : {};
+  normalized.packingTime = /^\d{2}:\d{2}$/.test(saved.packingTime || "") ? saved.packingTime : "21:30";
+  normalized.packingChecked = saved.packingChecked && typeof saved.packingChecked === "object" ? saved.packingChecked : {};
+  normalized.lastReminderDate = typeof saved.lastReminderDate === "string" ? saved.lastReminderDate : "";
   const savedAiConfig = saved.aiConfig && typeof saved.aiConfig === "object" ? saved.aiConfig : {};
-  state.aiConfig = {
+  normalized.aiConfig = {
     provider: ["openai", "ollama", "gemini"].includes(savedAiConfig.provider) ? savedAiConfig.provider : "openai",
     baseUrl: typeof savedAiConfig.baseUrl === "string" ? savedAiConfig.baseUrl : "",
     apiKey: typeof savedAiConfig.apiKey === "string" ? savedAiConfig.apiKey : "",
     textModel: typeof savedAiConfig.textModel === "string" ? savedAiConfig.textModel : "",
     visionModel: typeof savedAiConfig.visionModel === "string" ? savedAiConfig.visionModel : ""
   };
-  state.chatMessages = Array.isArray(saved.chatMessages)
+  normalized.chatMessages = Array.isArray(saved.chatMessages)
     ? saved.chatMessages.filter((message) =>
       message && ["user", "assistant"].includes(message.role) && typeof message.content === "string"
     ).slice(-40)
     : [];
+  return normalized;
+}
+
+try {
+  state = normalizeState(JSON.parse(localStorage.getItem(storageKey) || "{}"));
 } catch (error) {
   console.warn("無法讀取已儲存的使用狀態。", error);
+}
+
+try {
+  const savedSyncSettings = JSON.parse(localStorage.getItem(syncStorageKey) || "{}");
+  syncSettings = {
+    token: typeof savedSyncSettings.token === "string" ? savedSyncSettings.token : "",
+    gistId: typeof savedSyncSettings.gistId === "string" ? savedSyncSettings.gistId : "",
+    updatedAt: Number.isFinite(savedSyncSettings.updatedAt) ? savedSyncSettings.updatedAt : 0,
+    lastSyncedAt: Number.isFinite(savedSyncSettings.lastSyncedAt) ? savedSyncSettings.lastSyncedAt : 0
+  };
+} catch (error) {
+  console.warn("無法讀取 GitHub 同步設定。", error);
 }
 
 function localDateString(date) {
@@ -79,10 +106,200 @@ function localDateString(date) {
 function saveState() {
   try {
     localStorage.setItem(storageKey, JSON.stringify(state));
+    syncSettings.updatedAt = Date.now();
+    saveSyncSettings();
+    scheduleCloudUpload();
   } catch (error) {
     console.error("無法儲存使用狀態。", error);
     showToast("儲存失敗，請檢查瀏覽器儲存空間。");
   }
+}
+
+function saveSyncSettings() {
+  try {
+    localStorage.setItem(syncStorageKey, JSON.stringify(syncSettings));
+  } catch (error) {
+    console.error("無法儲存 GitHub 同步設定。", error);
+    showToast("同步設定儲存失敗，請檢查瀏覽器儲存空間。");
+  }
+}
+
+function setSyncStatus(status) {
+  syncStatus = status;
+  const statusElement = document.querySelector("#github-sync-status");
+  const lastSyncedElement = document.querySelector("#github-sync-last-time");
+  if (!statusElement || !lastSyncedElement) return;
+  statusElement.textContent = status;
+  statusElement.classList.toggle("is-connected", status === "已同步");
+  lastSyncedElement.textContent = syncSettings.lastSyncedAt
+    ? new Intl.DateTimeFormat("zh-TW", { dateStyle: "short", timeStyle: "short" }).format(syncSettings.lastSyncedAt)
+    : "尚未同步";
+}
+
+function persistSyncForm() {
+  syncSettings.token = document.querySelector("#github-token").value.trim();
+  syncSettings.gistId = document.querySelector("#github-gist-id").value.trim();
+  saveSyncSettings();
+  if (!syncSettings.token) {
+    window.clearTimeout(syncTimer);
+    setSyncStatus("未設定");
+  } else if (syncStatus === "未設定" || syncStatus === "已同步") {
+    setSyncStatus("待同步");
+  }
+}
+
+function scheduleCloudUpload() {
+  if (!syncSettings.token) return;
+  window.clearTimeout(syncTimer);
+  syncTimer = window.setTimeout(() => {
+    uploadToGist({ manual: false }).catch((error) => {
+      console.error("GitHub Gist 自動同步失敗：", error);
+      setSyncStatus("同步失敗");
+    });
+  }, 2000);
+}
+
+function createCloudDocument() {
+  const cloudState = JSON.parse(JSON.stringify(state));
+  cloudState.aiConfig.apiKey = "";
+  return {
+    updatedAt: syncSettings.updatedAt || Date.now(),
+    data: cloudState
+  };
+}
+
+async function githubRequest(path, options = {}) {
+  const response = await fetch(`https://api.github.com${path}`, {
+    ...options,
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${syncSettings.token}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+      ...options.headers
+    }
+  });
+  if (!response.ok) {
+    let detail = "";
+    try {
+      const body = await response.json();
+      detail = typeof body.message === "string" ? `：${body.message}` : "";
+    } catch (error) {
+      console.warn("無法讀取 GitHub API 錯誤內容。", error);
+    }
+    throw new Error(`GitHub API 錯誤 (${response.status})${detail}`);
+  }
+  return response.json();
+}
+
+async function uploadToGist({ manual = true } = {}) {
+  persistSyncForm();
+  if (!syncSettings.token) throw new Error("請先填寫 GitHub Token。");
+  if (syncInProgress) {
+    if (!manual) {
+      scheduleCloudUpload();
+      return;
+    }
+    throw new Error("另一項同步作業仍在進行中。");
+  }
+  if (!syncSettings.updatedAt) {
+    syncSettings.updatedAt = Date.now();
+    saveSyncSettings();
+  }
+  syncInProgress = true;
+  setSyncStatus("同步中");
+  try {
+    const cloudDocument = createCloudDocument();
+    const requestBody = {
+      description: "學業中控 App 自動同步資料",
+      files: { [syncFileName]: { content: JSON.stringify(cloudDocument) } }
+    };
+    const gist = syncSettings.gistId
+      ? await githubRequest(`/gists/${encodeURIComponent(syncSettings.gistId)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody)
+      })
+      : await githubRequest("/gists", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...requestBody, public: false })
+      });
+    if (!gist.id) throw new Error("GitHub 未回傳有效的 Gist ID。");
+    syncSettings.gistId = gist.id;
+    syncSettings.lastSyncedAt = Date.now();
+    saveSyncSettings();
+    document.querySelector("#github-gist-id").value = gist.id;
+    setSyncStatus("已同步");
+    if (manual) showToast("資料已上傳至 GitHub Gist。");
+    if (syncSettings.updatedAt !== cloudDocument.updatedAt) scheduleCloudUpload();
+  } finally {
+    syncInProgress = false;
+  }
+}
+
+async function pullFromGist() {
+  persistSyncForm();
+  if (!syncSettings.token) throw new Error("請先填寫 GitHub Token。");
+  if (!syncSettings.gistId) throw new Error("請先填入 Gist ID，或先使用「立即上傳同步」建立 Gist。");
+  if (syncInProgress) throw new Error("另一項同步作業仍在進行中。");
+  syncInProgress = true;
+  setSyncStatus("同步中");
+  try {
+    const gist = await githubRequest(`/gists/${encodeURIComponent(syncSettings.gistId)}`);
+    const file = gist.files && gist.files[syncFileName];
+    if (!file || typeof file.content !== "string") {
+      throw new Error(`Gist 中找不到 ${syncFileName}。`);
+    }
+    const cloudDocument = JSON.parse(file.content);
+    if (!cloudDocument || !Number.isFinite(cloudDocument.updatedAt) || !cloudDocument.data || typeof cloudDocument.data !== "object") {
+      throw new Error("Gist 同步資料格式無效。");
+    }
+    if (cloudDocument.updatedAt > syncSettings.updatedAt) {
+      const localApiKey = state.aiConfig.apiKey;
+      state = normalizeState(cloudDocument.data);
+      state.aiConfig.apiKey = localApiKey;
+      localStorage.setItem(storageKey, JSON.stringify(state));
+      syncSettings.updatedAt = cloudDocument.updatedAt;
+      syncSettings.lastSyncedAt = Date.now();
+      saveSyncSettings();
+      renderDate();
+      renderTasks();
+      renderBookmarks();
+      renderTimetable();
+      renderBindings();
+      renderPacking();
+      renderNotificationStatus();
+      renderAiConfig();
+      renderChat();
+      document.querySelector("#packing-time").value = state.packingTime;
+      setSyncStatus("已同步");
+      showToast("已從 GitHub Gist 套用較新的資料。");
+    } else {
+      syncSettings.lastSyncedAt = Date.now();
+      saveSyncSettings();
+      setSyncStatus("已同步");
+      showToast("本機資料較新或相同，未覆蓋本機資料。");
+      if (syncSettings.updatedAt > cloudDocument.updatedAt) scheduleCloudUpload();
+    }
+  } finally {
+    syncInProgress = false;
+  }
+}
+
+async function runSync(action) {
+  try {
+    await action();
+  } catch (error) {
+    console.error("GitHub Gist 同步失敗：", error);
+    setSyncStatus("同步失敗");
+    showToast(error.message || "GitHub Gist 同步失敗，請檢查連線與設定。");
+  }
+}
+
+function renderSyncSettings() {
+  document.querySelector("#github-token").value = syncSettings.token;
+  document.querySelector("#github-gist-id").value = syncSettings.gistId;
+  setSyncStatus(syncSettings.token ? (syncSettings.lastSyncedAt ? "已同步" : "待同步") : "未設定");
 }
 
 function showToast(message) {
@@ -947,6 +1164,13 @@ document.querySelector("#clear-ai-key").addEventListener("click", () => {
   showToast("已清除儲存的 API Key。");
 });
 
+document.querySelector("#github-sync-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+});
+document.querySelector("#github-sync-form").addEventListener("input", persistSyncForm);
+document.querySelector("#github-upload").addEventListener("click", () => runSync(() => uploadToGist()));
+document.querySelector("#github-pull").addEventListener("click", () => runSync(pullFromGist));
+
 document.querySelector("#ai-provider").addEventListener("change", (event) => {
   const baseInput = document.querySelector("#ai-base-url");
   const providerHints = {
@@ -1018,7 +1242,9 @@ renderPacking();
 renderNotificationStatus();
 renderAiConfig();
 renderChat();
+renderSyncSettings();
 document.querySelector("#packing-time").value = state.packingTime;
+if (syncSettings.token && syncSettings.gistId) runSync(pullFromGist);
 
 let activeDate = localDateString(new Date());
 window.setInterval(() => {

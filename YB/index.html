@@ -7,7 +7,7 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="description" content="考試、作業與每日練習中控面板。">
-    <title>學業中控台</title>
+    <title>影白小木屋</title>
     <link rel="manifest" href="./manifest.json">
     <link rel="icon" href="./icon-192.svg" type="image/svg+xml">
     <link rel="apple-touch-icon" href="./icon-192.svg">
@@ -198,6 +198,24 @@
               <button class="add-button" type="submit">儲存連線</button>
             </div>
             <p class="security-note">設定只存在此瀏覽器的 localStorage；API Key 未加密。對話與課表圖片會直接傳送至你填寫的 API，請勿在共用或公開裝置輸入敏感資料。連線需要 API 允許瀏覽器 CORS。</p>
+          </form>
+          <form class="panel-card settings-form" id="github-sync-form">
+            <div class="settings-section-heading">
+              <div><h2>雲端自動同步 (GitHub Gist)</h2><p>資料變更後 2 秒自動上傳；開啟 App 時檢查雲端更新</p></div>
+              <span class="connection-indicator" id="github-sync-status" role="status" aria-live="polite">未設定</span>
+            </div>
+            <label class="field-label" for="github-token">GitHub Token
+              <input id="github-token" name="token" type="password" autocomplete="off" placeholder="輸入具有 Gist 權限的 Token">
+            </label>
+            <label class="field-label" for="github-gist-id">Gist ID（第二台裝置可貼上既有 ID）
+              <input id="github-gist-id" name="gistId" type="text" autocomplete="off" placeholder="首次上傳會自動建立 Secret Gist">
+            </label>
+            <p class="sync-time">最後同步：<time id="github-sync-last-time">尚未同步</time></p>
+            <div class="settings-actions">
+              <button class="text-button" id="github-pull" type="button">從雲端拉取</button>
+              <button class="add-button" id="github-upload" type="button">立即上傳同步</button>
+            </div>
+            <p class="security-note">Token 只儲存在此瀏覽器的 localStorage，不會寫入同步 JSON；建議使用僅有 Gist 權限的 Token。Secret Gist 並非加密或存取控制，取得連結者仍可能讀取內容。AI API Key 也不會上傳。</p>
           </form>
         </section>
       </main>
