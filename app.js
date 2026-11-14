@@ -1,30 +1,45 @@
 const storageKey = "night-space-state";
 const syncStorageKey = "night-space-github-sync";
 const syncFileName = "yb-study-sync.json";
+const maxExamCoverFileSize = 20 * 1024 * 1024;
+const maxExamCoverBlobSize = 100 * 1024;
+const maxExamCoverDataSize = 140 * 1024;
+const maxTotalExamCoverDataSize = 480 * 1024;
+const maxGistContentSize = 950 * 1024;
 const weekdays = ["週一", "週二", "週三", "週四", "週五"];
 const defaultSubjects = ["國文", "英文", "數學", "物理", "化學", "生物", "歷史", "地理", "公民"];
 const taskTypes = { exam: "考試", homework: "作業", practice: "練習" };
-const taskLists = { exam: "#exam-list", homework: "#homework-list", practice: "#daily-list" };
+const taskLists = { exam: "#exam-list", homework: "#homework-list" };
 
 let toastTimer;
 let swRegistration = null;
-let selectedPackingDay = "today";
 let chatRequestInProgress = false;
 let timetableScanInProgress = false;
+let focusInterval = null;
+let focusDurationMinutes = 25;
+let focusRemainingSeconds = 25 * 60;
+let focusEndsAt = 0;
 let syncTimer;
 let syncInProgress = false;
 let syncSettings = { token: "", gistId: "", updatedAt: 0, lastSyncedAt: 0 };
 let syncStatus = "未設定";
+let legacyCountdownsMigrated = false;
+let practiceStreaksMigrated = false;
+let taskEditorCoverImage = "";
+let examCoverCompressionInProgress = false;
 let state = createDefaultState();
 
 function createDefaultState() {
   return {
     focusMinutes: 0,
     completedCount: 0,
+    focusDate: "",
     tasks: [],
+    countdowns: [],
     bookmarks: [],
     timetable: Array.from({ length: 8 }, () => Array(5).fill("")),
     bindings: {},
+    deletedSubjects: [],
     packingTime: "21:30",
     packingChecked: {},
     lastReminderDate: "",
@@ -37,21 +52,95 @@ function normalizeState(saved) {
   const normalized = createDefaultState();
   normalized.focusMinutes = Number.isFinite(saved.focusMinutes) ? saved.focusMinutes : 0;
   normalized.completedCount = Number.isFinite(saved.completedCount) ? saved.completedCount : 0;
-  normalized.tasks = Array.isArray(saved.tasks) ? saved.tasks.map((task) => ({
-    ...task,
-    type: taskTypes[task.type] ? task.type : "homework",
-    subject: typeof task.subject === "string" ? task.subject : "",
-    scope: typeof task.scope === "string" ? task.scope : "",
-    goal: typeof task.goal === "string" ? task.goal : "",
-    completed: Boolean(task.completed),
-    completedOn: typeof task.completedOn === "string" ? task.completedOn : ""
-  })) : [];
-  normalized.tasks.forEach((task) => {
-    if (task.type === "practice" && task.completed && !task.completedOn) {
-      task.completedOn = localDateString(new Date());
-      task.completed = false;
+  normalized.focusDate = typeof saved.focusDate === "string" ? saved.focusDate : "";
+  if (!normalized.focusDate) {
+    normalized.focusDate = localDateString(new Date());
+  } else if (normalized.focusDate !== localDateString(new Date())) {
+    normalized.focusMinutes = 0;
+    normalized.focusDate = localDateString(new Date());
+  }
+  normalized.tasks = Array.isArray(saved.tasks) ? saved.tasks.map((task) => {
+    const type = taskTypes[task.type] ? task.type : "homework";
+    const practiceMode = type === "practice" ? (task.practiceMode === "one-time" ? "one-time" : "daily") : "";
+    const date = task.deadlineTbd || !isValidDateString(task.date) ? "" : task.date;
+    const endDate = task.deadlineTbd || !isValidDateString(task.endDate) || (date && task.endDate < date) ? "" : task.endDate;
+    let completedOn = isValidDateString(task.completedOn) ? task.completedOn : "";
+    let lastCompletedDate = isValidDateString(task.lastCompletedDate) ? task.lastCompletedDate : completedOn;
+    const hasSavedStreak = Number.isSafeInteger(task.streak) && task.streak >= 0;
+    let streak = hasSavedStreak ? task.streak : (practiceMode === "daily" && lastCompletedDate ? 1 : 0);
+    let completed = Boolean(task.completed);
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    const yesterdayString = localDateString(yesterday);
+
+    if (type === "practice" && practiceMode === "daily") {
+      if (!lastCompletedDate && completed) {
+        lastCompletedDate = localDateString(new Date());
+        if (!hasSavedStreak) streak = 1;
+      }
+      if (lastCompletedDate && lastCompletedDate < yesterdayString && streak > 0) {
+        streak = 0;
+        practiceStreaksMigrated = true;
+      }
+      completed = false;
+      completedOn = lastCompletedDate;
+    } else if (type === "practice") {
+      lastCompletedDate = "";
+      streak = 0;
+    } else {
+      lastCompletedDate = "";
+      streak = 0;
     }
-  });
+
+    return {
+      ...task,
+      type,
+      subject: typeof task.subject === "string" ? task.subject : "",
+      scope: typeof task.scope === "string" ? task.scope : "",
+      goal: typeof task.goal === "string" ? task.goal : "",
+      date,
+      endDate,
+      coverImage: normalizeExamCoverImage(task.coverImage),
+      notes: typeof task.notes === "string" ? task.notes : "",
+      priority: ["high", "normal", "low"].includes(task.priority) ? task.priority : "normal",
+      practiceMode,
+      deadlineTbd: Boolean(task.deadlineTbd),
+      completed,
+      completedOn,
+      lastCompletedDate,
+      streak
+    };
+  }) : [];
+  const legacyCountdowns = Array.isArray(saved.countdowns) ? saved.countdowns.filter((item) =>
+    item && typeof item.id === "string" && typeof item.title === "string" && item.title.trim()
+    && isValidDateString(item.date)
+  ) : [];
+  normalized.countdowns = [];
+  if (legacyCountdowns.length) {
+    legacyCountdownsMigrated = true;
+    const taskIds = new Set(normalized.tasks.map((task) => task.id));
+    legacyCountdowns.forEach((item) => {
+      const id = `legacy-countdown-${item.id}`;
+      if (taskIds.has(id)) return;
+      normalized.tasks.push({
+        id,
+        type: "exam",
+        title: item.title,
+        subject: "",
+        scope: "",
+        goal: "",
+        date: item.date,
+        endDate: "",
+        coverImage: "",
+        notes: typeof item.note === "string" ? item.note : "",
+        priority: "high",
+        deadlineTbd: false,
+        completed: false,
+        completedOn: ""
+      });
+      taskIds.add(id);
+    });
+  }
   normalized.bookmarks = Array.isArray(saved.bookmarks) ? saved.bookmarks : [];
   normalized.timetable = Array.from({ length: 8 }, (_, period) =>
     Array.from({ length: 5 }, (_, day) =>
@@ -59,6 +148,9 @@ function normalizeState(saved) {
     )
   );
   normalized.bindings = saved.bindings && typeof saved.bindings === "object" && !Array.isArray(saved.bindings) ? saved.bindings : {};
+  normalized.deletedSubjects = Array.isArray(saved.deletedSubjects)
+    ? saved.deletedSubjects.filter((subject) => typeof subject === "string")
+    : [];
   normalized.packingTime = /^\d{2}:\d{2}$/.test(saved.packingTime || "") ? saved.packingTime : "21:30";
   normalized.packingChecked = saved.packingChecked && typeof saved.packingChecked === "object" ? saved.packingChecked : {};
   normalized.lastReminderDate = typeof saved.lastReminderDate === "string" ? saved.lastReminderDate : "";
@@ -96,11 +188,49 @@ try {
   console.warn("無法讀取 GitHub 同步設定。", error);
 }
 
+if (legacyCountdownsMigrated || practiceStreaksMigrated) {
+  try {
+    localStorage.setItem(storageKey, JSON.stringify(state));
+  } catch (error) {
+    console.error("無法儲存相容性資料。", error);
+    showToast("資料已載入，但部分相容性調整無法儲存。");
+  }
+}
+
 function localDateString(date) {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+function resetExpiredPracticeStreaks(today = localDateString(new Date())) {
+  const yesterday = new Date(`${today}T00:00:00`);
+  yesterday.setDate(yesterday.getDate() - 1);
+  const yesterdayString = localDateString(yesterday);
+  let changed = false;
+  state.tasks.forEach((task) => {
+    if (task.type === "practice" && task.practiceMode !== "one-time" && task.streak > 0
+      && (!task.lastCompletedDate || task.lastCompletedDate < yesterdayString)) {
+      task.streak = 0;
+      changed = true;
+    }
+  });
+  return changed;
+}
+
+function isValidDateString(dateString) {
+  if (typeof dateString !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(dateString)) return false;
+  const date = new Date(`${dateString}T00:00:00`);
+  return Number.isFinite(date.getTime()) && localDateString(date) === dateString;
+}
+
+function normalizeExamCoverImage(value) {
+  if (typeof value !== "string") return "";
+  if (value.length <= maxExamCoverDataSize && /^data:image\/(?:jpeg|png|webp|gif);base64,[a-z0-9+/]+=*$/i.test(value)) {
+    return value;
+  }
+  return isHttpImageUrl(value) ? value : "";
 }
 
 function saveState() {
@@ -209,9 +339,13 @@ async function uploadToGist({ manual = true } = {}) {
   setSyncStatus("同步中");
   try {
     const cloudDocument = createCloudDocument();
+    const content = JSON.stringify(cloudDocument);
+    if (new Blob([content]).size > maxGistContentSize) {
+      throw new Error("同步資料超過 950 KiB，請移除部分考試封面或過長的舊對話後重試。");
+    }
     const requestBody = {
       description: "學業中控 App 自動同步資料",
-      files: { [syncFileName]: { content: JSON.stringify(cloudDocument) } }
+      files: { [syncFileName]: { content } }
     };
     const gist = syncSettings.gistId
       ? await githubRequest(`/gists/${encodeURIComponent(syncSettings.gistId)}`, {
@@ -271,6 +405,7 @@ async function pullFromGist() {
       renderNotificationStatus();
       renderAiConfig();
       renderChat();
+      renderFocusTimer();
       document.querySelector("#packing-time").value = state.packingTime;
       setSyncStatus("已同步");
       showToast("已從 GitHub Gist 套用較新的資料。");
@@ -318,9 +453,10 @@ function makeElement(tag, className, text) {
 }
 
 function taskCompleted(task) {
-  return task.type === "practice"
-    ? task.completedOn === localDateString(new Date())
-    : Boolean(task.completed);
+  if (task.type !== "practice") return Boolean(task.completed);
+  return task.practiceMode === "one-time"
+    ? Boolean(task.completed)
+    : task.lastCompletedDate === localDateString(new Date());
 }
 
 function formatDate(dateString) {
@@ -353,23 +489,36 @@ function renderTasks() {
     if (groups[task.type]) groups[task.type].push(task);
   });
 
-  Object.entries(groups).forEach(([type, tasks]) => {
-    const list = document.querySelector(taskLists[type]);
-    list.replaceChildren();
+  const sortTasks = (tasks) => {
+    const priorityOrder = { high: 0, normal: 1, low: 2 };
     tasks.sort((a, b) => {
       const dateOrder = (a.date || "9999").localeCompare(b.date || "9999");
       if (dateOrder !== 0) return dateOrder;
+      const priorityDifference = priorityOrder[a.priority] - priorityOrder[b.priority];
+      if (priorityDifference !== 0) return priorityDifference;
       return String(a.title).localeCompare(String(b.title), "zh-Hant");
     });
+  };
+
+  Object.entries(groups).filter(([type]) => type !== "practice").forEach(([type, tasks]) => {
+    const list = document.querySelector(taskLists[type]);
+    list.replaceChildren();
+    sortTasks(tasks);
 
     if (!tasks.length) {
-      list.append(makeElement("p", "empty-state", type === "practice" ? "尚未建立每日練習" : "沒有排定項目"));
+      const emptyText = type === "exam" ? "尚無考試日程" : "沒有排定項目";
+      list.append(makeElement("p", "empty-state", emptyText));
     }
 
     tasks.forEach((task) => {
       const done = taskCompleted(task);
+      if (type === "exam") {
+        list.append(renderExamCard(task, done));
+        return;
+      }
+      const preciseTime = /^\d{2}:\d{2}$/.test(task.time || "");
       const overdue = type === "homework" && !done && task.date && (
-        task.date < today || (task.date === today && task.time && task.time < new Date().toTimeString().slice(0, 5))
+        task.date < today || (task.date === today && preciseTime && task.time < new Date().toTimeString().slice(0, 5))
       );
       const row = makeElement("article", `task-row${done ? " is-complete" : ""}${overdue ? " is-overdue" : ""}`);
       const checkbox = makeElement("input", "task-toggle");
@@ -383,20 +532,15 @@ function renderTasks() {
       copy.append(makeElement("strong", "task-name", task.title));
       const meta = [];
       if (task.subject) meta.push(task.subject);
-      if (type === "exam" && task.scope) meta.push(`範圍：${task.scope}`);
-      if (type === "practice" && task.goal) meta.push(task.goal);
-      if (type === "exam" || type === "homework") {
-        meta.push(`${type === "exam" ? "考期" : "期限"} ${formatDate(task.date)}${task.time ? ` ${task.time}` : ""}`);
-      }
+      if (task.notes) meta.push(task.notes);
+      if (task.deadlineTbd) meta.push(`時間未定${task.time ? ` · ${task.time}` : ""}`);
+      else if (task.date) meta.push(`期限 ${formatDate(task.date)}${task.time ? ` · ${task.time}` : ""}`);
       if (overdue) meta.push("逾期");
+      const priorityLabels = { high: "高優先", normal: "一般", low: "低優先" };
+      copy.append(makeElement("span", `priority-pill priority-${task.priority}`, priorityLabels[task.priority] || "一般"));
       if (meta.length) copy.append(makeElement("span", "task-meta", meta.join(" · ")));
 
       const actions = makeElement("div", "task-actions");
-      if (type === "exam" && task.date && !done) {
-        const days = daysUntil(task.date);
-        const countdown = days === 0 ? "D-Day" : days > 0 ? `D-${days}` : `D+${Math.abs(days)}`;
-        actions.append(makeElement("span", `countdown${days <= 3 ? " is-soon" : ""}`, countdown));
-      }
       const editButton = makeElement("button", "row-action", "編輯");
       editButton.type = "button";
       editButton.dataset.taskAction = "edit";
@@ -413,29 +557,176 @@ function renderTasks() {
     });
   });
 
-  const dailyTasks = groups.practice;
-  const dailyDone = dailyTasks.filter(taskCompleted).length;
-  const dailyPercent = dailyTasks.length ? (dailyDone / dailyTasks.length) * 100 : 0;
-  document.querySelector("#daily-count").textContent = String(dailyTasks.length);
-  document.querySelector("#daily-progress-label").textContent = `${dailyDone} / ${dailyTasks.length} 完成`;
-  document.querySelector("#daily-progress").style.width = `${dailyPercent}%`;
+  const dailyTasks = groups.practice.filter((task) => task.practiceMode !== "one-time");
+  const oneTimeTasks = groups.practice.filter((task) => task.practiceMode === "one-time");
+  sortTasks(dailyTasks);
+  sortTasks(oneTimeTasks);
+  renderPracticeTasks("#daily-habits-list", dailyTasks, true);
+  renderPracticeTasks("#one-time-goals-list", oneTimeTasks, false);
+
+  const practiceDone = groups.practice.filter(taskCompleted).length;
+  const practicePercent = groups.practice.length ? (practiceDone / groups.practice.length) * 100 : 0;
+  document.querySelector("#practice-count").textContent = String(groups.practice.length);
+  document.querySelector("#daily-habits-count").textContent = String(dailyTasks.length);
+  document.querySelector("#one-time-goals-count").textContent = String(oneTimeTasks.length);
+  document.querySelector("#practice-progress-label").textContent = `${practiceDone} / ${groups.practice.length} 完成`;
+  document.querySelector("#practice-progress").style.width = `${practicePercent}%`;
   document.querySelector("#exam-count").textContent = String(groups.exam.length);
   document.querySelector("#homework-count").textContent = String(groups.homework.length);
   const openCount = state.tasks.filter((task) => !taskCompleted(task)).length;
   document.querySelector("#open-task-count").textContent = String(openCount);
 }
 
+function renderPracticeTasks(selector, tasks, isDaily) {
+  const list = document.querySelector(selector);
+  list.replaceChildren();
+  if (!tasks.length) {
+    list.append(makeElement("p", "empty-state", isDaily ? "尚未建立每日必練" : "尚無單次目標"));
+    return;
+  }
+
+  const today = localDateString(new Date());
+  tasks.forEach((task) => {
+    const done = taskCompleted(task);
+    const row = makeElement("article", `task-row practice-task-row${done ? " is-complete" : ""}`);
+    const checkbox = makeElement("input", "task-toggle");
+    checkbox.type = "checkbox";
+    checkbox.checked = done;
+    checkbox.dataset.taskAction = "toggle";
+    checkbox.dataset.taskId = task.id;
+    checkbox.setAttribute("aria-label", `標記「${task.title}」${done ? "未完成" : "完成"}`);
+
+    const copy = makeElement("div", "task-copy");
+    copy.append(makeElement("strong", "task-name", task.title));
+    const meta = [];
+    if (task.subject) meta.push(task.subject);
+    if (task.goal) meta.push(task.goal);
+    if (!isDaily) {
+      if (task.deadlineTbd) meta.push("時間未定");
+      else if (task.date) meta.push(`目標 ${formatDate(task.date)}`);
+      if (task.date && task.date < today && !done) meta.push("逾期");
+    }
+    if (task.notes) meta.push(task.notes);
+    copy.append(makeElement("span", `priority-pill priority-${task.priority}`, { high: "高優先", normal: "一般", low: "低優先" }[task.priority] || "一般"));
+    if (meta.length) copy.append(makeElement("span", "task-meta", meta.join(" · ")));
+    if (isDaily) {
+      copy.append(makeElement("span", "practice-streak", `連續 ${task.streak} 天`));
+    }
+
+    const actions = makeElement("div", "task-actions");
+    const editButton = makeElement("button", "row-action", "編輯");
+    editButton.type = "button";
+    editButton.dataset.taskAction = "edit";
+    editButton.dataset.taskId = task.id;
+    editButton.setAttribute("aria-label", `編輯「${task.title}」`);
+    const deleteButton = makeElement("button", "row-action delete-action", "刪除");
+    deleteButton.type = "button";
+    deleteButton.dataset.taskAction = "delete";
+    deleteButton.dataset.taskId = task.id;
+    deleteButton.setAttribute("aria-label", `刪除「${task.title}」`);
+    actions.append(editButton, deleteButton);
+    row.append(checkbox, copy, actions);
+    list.append(row);
+  });
+}
+
+function renderExamCard(task, done) {
+  const days = task.deadlineTbd || !task.date ? null : daysUntil(task.date);
+  const isSoon = days !== null && days >= 0 && days <= 7;
+  const isPast = days !== null && days < 0;
+  const card = makeElement("article", `exam-card${done ? " is-complete" : ""}${isSoon ? " is-soon" : ""}${isPast ? " is-past" : ""}`);
+
+  if (task.coverImage) {
+    const coverButton = makeElement("button", "exam-cover-button");
+    coverButton.type = "button";
+    coverButton.dataset.examImageId = task.id;
+    coverButton.setAttribute("aria-label", `放大查看「${task.title}」考試圖片`);
+    const image = document.createElement("img");
+    image.src = task.coverImage;
+    image.alt = "";
+    image.addEventListener("error", () => coverButton.classList.add("is-unavailable"), { once: true });
+    coverButton.append(image, makeElement("span", "exam-cover-expand", "⤢"));
+    card.append(coverButton);
+  }
+
+  const content = makeElement("div", "exam-card-content");
+  const header = makeElement("div", "exam-card-header");
+  const titleGroup = makeElement("div", "exam-card-title-group");
+  const checkbox = makeElement("input", "task-toggle");
+  checkbox.type = "checkbox";
+  checkbox.checked = done;
+  checkbox.dataset.taskAction = "toggle";
+  checkbox.dataset.taskId = task.id;
+  checkbox.setAttribute("aria-label", `標記「${task.title}」${done ? "未完成" : "完成"}`);
+  titleGroup.append(checkbox, makeElement("strong", "exam-card-title", task.title));
+
+  const countdownText = days === null
+    ? "時間未定"
+    : days === 0 ? "D-Day" : days > 0 ? `D-${days}` : `D+${Math.abs(days)}`;
+  const countdown = makeElement("span", `exam-card-countdown${isSoon ? " is-soon" : ""}${isPast ? " is-past" : ""}`, countdownText);
+  header.append(titleGroup, countdown);
+  content.append(header);
+
+  const details = makeElement("div", "exam-card-details");
+  if (task.subject) details.append(makeElement("span", "exam-card-tag", task.subject));
+  const priorityLabels = { high: "高優先", normal: "一般", low: "低優先" };
+  details.append(makeElement("span", `priority-pill priority-${task.priority}`, priorityLabels[task.priority] || "一般"));
+  if (task.date) {
+    const dateLabel = task.endDate && task.endDate !== task.date
+      ? `${formatDate(task.date)} – ${formatDate(task.endDate)}`
+      : formatDate(task.date);
+    details.append(makeElement("span", "exam-card-date", dateLabel));
+  }
+  content.append(details);
+  if (task.scope) content.append(makeElement("p", "exam-card-note", `範圍：${task.scope}`));
+  if (task.notes) content.append(makeElement("p", "exam-card-note", task.notes));
+
+  const actions = makeElement("div", "exam-card-actions");
+  const editButton = makeElement("button", "row-action", "編輯");
+  editButton.type = "button";
+  editButton.dataset.taskAction = "edit";
+  editButton.dataset.taskId = task.id;
+  editButton.setAttribute("aria-label", `編輯「${task.title}」`);
+  const deleteButton = makeElement("button", "row-action delete-action", "刪除");
+  deleteButton.type = "button";
+  deleteButton.dataset.taskAction = "delete";
+  deleteButton.dataset.taskId = task.id;
+  deleteButton.setAttribute("aria-label", `刪除「${task.title}」`);
+  actions.append(editButton, deleteButton);
+  content.append(actions);
+  card.append(content);
+  return card;
+}
+
 function updateTaskFields() {
   const type = document.querySelector("#task-type").value;
   const isPractice = type === "practice";
   const isExam = type === "exam";
-  document.querySelector("#task-date-field").classList.toggle("hidden", isPractice);
+  const practiceMode = document.querySelector("input[name='practiceMode']:checked")?.value || "daily";
+  const isDailyPractice = isPractice && practiceMode === "daily";
+  const dateTbd = document.querySelector("#task-deadline-tbd").checked;
+  const dateInput = document.querySelector("#task-date");
+  const endDateInput = document.querySelector("#task-end-date");
+  document.querySelector("#task-date-label").textContent = isExam ? "考試日期（起）" : "截止期限（日期）";
+  document.querySelector("#task-date-field").classList.toggle("hidden", isDailyPractice);
   document.querySelector("#task-time-field").classList.toggle("hidden", type !== "homework");
   document.querySelector("#task-scope-field").classList.toggle("hidden", !isExam);
+  document.querySelector("#task-end-date-field").classList.toggle("hidden", !isExam);
+  document.querySelector("#task-cover-field").classList.toggle("hidden", !isExam);
+  document.querySelector("#task-practice-mode-field").classList.toggle("hidden", !isPractice);
   document.querySelector("#task-goal-field").classList.toggle("hidden", !isPractice);
-  document.querySelector("#task-date").required = !isPractice;
+  document.querySelector("#task-goal-label").textContent = isDailyPractice ? "每日目標量" : "目標進度／範圍";
+  document.querySelector("#task-goal").placeholder = isDailyPractice ? "例如：每天算 1 題、至少 1 篇" : "例如：寫到第 5 回、p.55~85";
+  dateInput.disabled = dateTbd || isDailyPractice;
+  endDateInput.disabled = dateTbd || !isExam;
+  if (dateTbd) {
+    dateInput.value = "";
+    endDateInput.value = "";
+  }
+  dateInput.required = !dateTbd && !isDailyPractice && (isExam || type === "homework" || isPractice);
+  endDateInput.required = false;
   document.querySelector("#task-goal").required = isPractice;
-  document.querySelector("#task-subject").required = !isPractice;
+  document.querySelector("#task-subject").required = false;
 }
 
 function openTaskDialog(task) {
@@ -444,12 +735,22 @@ function openTaskDialog(task) {
   document.querySelector("#task-dialog-title").textContent = task ? "編輯項目" : "新增項目";
   document.querySelector("#task-id").value = task?.id || "";
   document.querySelector("#task-type").value = task?.type || "exam";
+  document.querySelector(`input[name='practiceMode'][value='${task?.practiceMode === "one-time" ? "one-time" : "daily"}']`).checked = true;
   document.querySelector("#task-title").value = task?.title || "";
+  populateTaskSubjects(task?.subject || "");
   document.querySelector("#task-subject").value = task?.subject || "";
+  document.querySelector("#task-priority").value = task?.priority || "normal";
   document.querySelector("#task-scope").value = task?.scope || "";
   document.querySelector("#task-date").value = task?.date || "";
+  document.querySelector("#task-end-date").value = task?.endDate || "";
+  document.querySelector("#task-deadline-tbd").checked = Boolean(task?.deadlineTbd);
   document.querySelector("#task-time").value = task?.time || "";
   document.querySelector("#task-goal").value = task?.goal || "";
+  document.querySelector("#task-notes").value = task?.notes || "";
+  taskEditorCoverImage = task?.type === "exam" ? task.coverImage || "" : "";
+  document.querySelector("#task-cover-url").value = taskEditorCoverImage.startsWith("data:image/") ? "" : taskEditorCoverImage;
+  document.querySelector("#task-cover-file").value = "";
+  renderExamCoverPreview(taskEditorCoverImage);
   updateTaskFields();
   document.querySelector("#task-dialog").showModal();
   document.querySelector("#task-title").focus();
@@ -519,12 +820,13 @@ function renderTimetable() {
 }
 
 function allBindingSubjects() {
+  const deletedSubjects = new Set(state.deletedSubjects);
   return [...new Set([
     ...defaultSubjects,
     ...Object.keys(state.bindings),
     ...state.timetable.flat().filter(Boolean),
     ...state.tasks.map((task) => task.subject).filter(Boolean)
-  ])]
+  ])].filter((subject) => !deletedSubjects.has(subject))
     .sort((a, b) => {
       const ai = defaultSubjects.indexOf(a);
       const bi = defaultSubjects.indexOf(b);
@@ -535,63 +837,278 @@ function allBindingSubjects() {
     });
 }
 
+function populateTaskSubjects(selectedSubject = "") {
+  const select = document.querySelector("#task-subject");
+  select.replaceChildren();
+  const blankOption = document.createElement("option");
+  blankOption.value = "";
+  blankOption.textContent = "不指定科目";
+  select.append(blankOption);
+  allBindingSubjects().forEach((subject) => {
+    const option = document.createElement("option");
+    option.value = subject;
+    option.textContent = subject;
+    select.append(option);
+  });
+  if (selectedSubject && !allBindingSubjects().includes(selectedSubject)) {
+    const option = document.createElement("option");
+    option.value = selectedSubject;
+    option.textContent = selectedSubject;
+    select.append(option);
+  }
+  select.value = selectedSubject;
+}
+
 function renderBindings() {
   const grid = document.querySelector("#binding-grid");
   grid.replaceChildren();
   allBindingSubjects().forEach((subject) => {
-    const row = makeElement("div", "binding-row");
-    const label = makeElement("label", "", subject);
-    const input = makeElement("input", "binding-input");
-    input.type = "text";
-    input.maxLength = 160;
-    input.value = Array.isArray(state.bindings[subject]) ? state.bindings[subject].join("，") : "";
-    input.placeholder = "課本、講義";
-    input.dataset.subject = subject;
-    input.id = `binding-${encodeURIComponent(subject)}`;
-    label.htmlFor = input.id;
-    row.append(label, input);
+    const row = makeElement("article", "binding-card");
+    const header = makeElement("div", "binding-card-header");
+    const title = makeElement("strong", "binding-subject-name", subject);
+    const actions = makeElement("div", "binding-card-actions");
+    const editButton = makeElement("button", "icon-button", "✎");
+    editButton.type = "button";
+    editButton.dataset.subjectAction = "rename";
+    editButton.dataset.subject = subject;
+    editButton.setAttribute("aria-label", `編輯「${subject}」科目名稱`);
+    const deleteButton = makeElement("button", "icon-button delete-action", "×");
+    deleteButton.type = "button";
+    deleteButton.dataset.subjectAction = "delete";
+    deleteButton.dataset.subject = subject;
+    deleteButton.setAttribute("aria-label", `刪除「${subject}」科目`);
+    actions.append(editButton, deleteButton);
+    header.append(title, actions);
+
+    const renameEditor = makeElement("div", "subject-rename hidden");
+    const renameInput = makeElement("input", "subject-rename-input");
+    renameInput.type = "text";
+    renameInput.maxLength = 24;
+    renameInput.value = subject;
+    renameInput.dataset.subjectRename = subject;
+    renameInput.setAttribute("aria-label", `新科目名稱：${subject}`);
+    const saveNameButton = makeElement("button", "small-button", "儲存");
+    saveNameButton.type = "button";
+    saveNameButton.dataset.subjectAction = "save-name";
+    saveNameButton.dataset.subject = subject;
+    const cancelNameButton = makeElement("button", "text-button", "取消");
+    cancelNameButton.type = "button";
+    cancelNameButton.dataset.subjectAction = "cancel-name";
+    cancelNameButton.dataset.subject = subject;
+    renameEditor.append(renameInput, saveNameButton, cancelNameButton);
+
+    const tags = makeElement("div", "binding-tags");
+    const books = Array.isArray(state.bindings[subject]) ? state.bindings[subject] : [];
+    books.forEach((book, index) => {
+      const pill = makeElement("div", "binding-tag");
+      pill.append(makeElement("span", "binding-tag-name", book));
+      const moveUpButton = makeElement("button", "tag-action", "↑");
+      moveUpButton.type = "button";
+      moveUpButton.disabled = index === 0;
+      moveUpButton.dataset.subjectAction = "move-book-up";
+      moveUpButton.dataset.subject = subject;
+      moveUpButton.dataset.bookIndex = String(index);
+      moveUpButton.setAttribute("aria-label", `將「${book}」上移`);
+      const moveDownButton = makeElement("button", "tag-action", "↓");
+      moveDownButton.type = "button";
+      moveDownButton.disabled = index === books.length - 1;
+      moveDownButton.dataset.subjectAction = "move-book-down";
+      moveDownButton.dataset.subject = subject;
+      moveDownButton.dataset.bookIndex = String(index);
+      moveDownButton.setAttribute("aria-label", `將「${book}」下移`);
+      const removeButton = makeElement("button", "tag-remove", "×");
+      removeButton.type = "button";
+      removeButton.dataset.subjectAction = "remove-book";
+      removeButton.dataset.subject = subject;
+      removeButton.dataset.bookIndex = String(index);
+      removeButton.setAttribute("aria-label", `移除「${book}」`);
+      pill.append(moveUpButton, moveDownButton, removeButton);
+      tags.append(pill);
+    });
+
+    const addBook = makeElement("div", "binding-add-book");
+    const addBookInput = makeElement("input", "binding-add-input");
+    addBookInput.type = "text";
+    addBookInput.maxLength = 60;
+    addBookInput.placeholder = "新增講義標籤";
+    addBookInput.dataset.bookInput = subject;
+    addBookInput.setAttribute("aria-label", `新增「${subject}」講義`);
+    const addBookButton = makeElement("button", "small-button", "加入");
+    addBookButton.type = "button";
+    addBookButton.dataset.subjectAction = "add-book";
+    addBookButton.dataset.subject = subject;
+    addBook.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        addBookButton.click();
+      }
+    });
+    addBook.append(addBookInput, addBookButton);
+
+    row.append(header, renameEditor, tags, addBook);
     grid.append(row);
   });
+}
+
+function renameSubject(oldName, newName) {
+  const nextName = newName.trim();
+  if (!nextName) {
+    showToast("科目名稱不可空白。");
+    return;
+  }
+  if (nextName === oldName) {
+    renderBindings();
+    return;
+  }
+  const oldBooks = Array.isArray(state.bindings[oldName]) ? state.bindings[oldName] : [];
+  const merging = allBindingSubjects().includes(nextName);
+  const nextBooks = Array.isArray(state.bindings[nextName]) ? state.bindings[nextName] : [];
+  state.bindings[nextName] = [...new Set(merging ? [...nextBooks, ...oldBooks] : oldBooks)];
+  delete state.bindings[oldName];
+  state.deletedSubjects = [...new Set([...state.deletedSubjects, oldName])].filter((subject) => subject !== nextName);
+  state.timetable = state.timetable.map((period) => period.map((subject) => subject === oldName ? nextName : subject));
+  state.tasks.forEach((task) => {
+    if (task.subject === oldName) task.subject = nextName;
+  });
+  renderTimetable();
+  renderBindings();
+  renderTasks();
+  renderPacking();
+  saveState();
+  showToast(merging ? `已合併至「${nextName}」。` : "科目名稱已更新。");
+}
+
+function deleteSubject(subject) {
+  const confirmed = window.confirm(`刪除「${subject}」？講義、課表格子與任務科目關聯會一併移除，任務本身會保留。`);
+  if (!confirmed) return;
+  delete state.bindings[subject];
+  state.deletedSubjects = [...new Set([...state.deletedSubjects, subject])];
+  state.timetable = state.timetable.map((period) => period.map((name) => name === subject ? "" : name));
+  state.tasks.forEach((task) => {
+    if (task.subject === subject) task.subject = "";
+  });
+  renderTimetable();
+  renderBindings();
+  renderTasks();
+  renderPacking();
+  saveState();
+  showToast(`已刪除「${subject}」。`);
+}
+
+function nextSchoolDayOffset(date = new Date()) {
+  const day = date.getDay();
+  if (day === 5) return 3;
+  if (day === 6) return 2;
+  return 1;
 }
 
 function packingBooks(offset) {
   const date = new Date();
   date.setDate(date.getDate() + offset);
   const day = date.getDay() - 1;
-  if (day < 0 || day > 4) return { date, subjects: [], books: [] };
+  if (day < 0 || day > 4) return { date, subjects: [], books: [], items: [] };
   const subjects = [...new Set(state.timetable.map((period) => period[day].trim()).filter(Boolean))];
-  const books = [];
+  const items = [];
   subjects.forEach((subject) => {
     const linkedBooks = Array.isArray(state.bindings[subject]) ? state.bindings[subject].filter((book) => book.trim()) : [];
-    if (linkedBooks.length) linkedBooks.forEach((book) => books.push(book.trim()));
-    else books.push(`${subject}（尚未設定講義）`);
+    if (linkedBooks.length) linkedBooks.forEach((book) => items.push({ subject, book: book.trim() }));
+    else items.push({ subject, book: `${subject}（尚未設定講義）` });
   });
-  return { date, subjects, books: [...new Set(books)] };
+  return { date, subjects, items, books: [...new Set(items.map((item) => item.book))] };
 }
 
 function renderPacking() {
-  const offset = selectedPackingDay === "tomorrow" ? 1 : 0;
-  const { date, subjects, books } = packingBooks(offset);
+  const offset = nextSchoolDayOffset();
+  const { date, subjects, items } = packingBooks(offset);
   const list = document.querySelector("#packing-list");
+  document.querySelector("#packing-date-label").textContent = `下一個上課日：${formatDate(localDateString(date))} · 課表自動彙整`;
   list.replaceChildren();
-  if (date.getDay() === 0 || date.getDay() === 6) {
-    list.append(makeElement("p", "empty-state", "週末沒有平日課表"));
-    return;
-  }
   if (!subjects.length) {
     list.append(makeElement("p", "empty-state", "這天尚未安排課程"));
     return;
   }
   const dateKey = localDateString(date);
-  books.forEach((book) => {
+  items.forEach(({ subject, book }) => {
     const label = makeElement("label", "packing-item");
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
     checkbox.checked = Boolean(state.packingChecked[`${dateKey}|${book}`]);
     checkbox.dataset.packKey = `${dateKey}|${book}`;
-    label.append(checkbox, makeElement("span", "", book));
+    label.append(checkbox, makeElement("span", "", `${subject} · ${book}`));
     list.append(label);
   });
+}
+
+function renderFocusTimer() {
+  const minutes = Math.floor(focusRemainingSeconds / 60);
+  const seconds = focusRemainingSeconds % 60;
+  document.querySelector("#focus-timer-display").textContent =
+    `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  document.querySelector("#today-focus-minutes").textContent = String(state.focusMinutes);
+  const running = Boolean(focusInterval);
+  document.querySelector("#focus-start").textContent = running ? "暫停" : "開始";
+  document.querySelectorAll("[data-focus-minutes]").forEach((button) => {
+    button.classList.toggle("is-selected", Number(button.dataset.focusMinutes) === focusDurationMinutes);
+    button.disabled = running;
+  });
+  document.querySelector("#focus-set-custom").disabled = running;
+  document.querySelector("#focus-custom-minutes").disabled = running;
+}
+
+function setFocusDuration(minutes) {
+  if (!Number.isInteger(minutes) || minutes < 1 || minutes > 180) {
+    showToast("自訂時間請輸入 1 到 180 分鐘。");
+    return;
+  }
+  if (focusInterval) return;
+  focusDurationMinutes = minutes;
+  focusRemainingSeconds = minutes * 60;
+  renderFocusTimer();
+}
+
+function finishFocusTimer() {
+  window.clearInterval(focusInterval);
+  focusInterval = null;
+  focusRemainingSeconds = 0;
+  const today = localDateString(new Date());
+  if (state.focusDate !== today) {
+    state.focusDate = today;
+    state.focusMinutes = 0;
+  }
+  state.focusMinutes += focusDurationMinutes;
+  saveState();
+  renderFocusTimer();
+  showToast(`專注完成，今日累積 ${state.focusMinutes} 分鐘。`);
+}
+
+function updateFocusTimer() {
+  focusRemainingSeconds = Math.max(0, Math.ceil((focusEndsAt - Date.now()) / 1000));
+  if (!focusRemainingSeconds) {
+    finishFocusTimer();
+    return;
+  }
+  renderFocusTimer();
+}
+
+function toggleFocusTimer() {
+  if (focusInterval) {
+    focusRemainingSeconds = Math.max(0, Math.ceil((focusEndsAt - Date.now()) / 1000));
+    window.clearInterval(focusInterval);
+    focusInterval = null;
+    renderFocusTimer();
+    return;
+  }
+  if (!focusRemainingSeconds) focusRemainingSeconds = focusDurationMinutes * 60;
+  focusEndsAt = Date.now() + focusRemainingSeconds * 1000;
+  focusInterval = window.setInterval(updateFocusTimer, 1000);
+  renderFocusTimer();
+}
+
+function resetFocusTimer() {
+  window.clearInterval(focusInterval);
+  focusInterval = null;
+  focusRemainingSeconds = focusDurationMinutes * 60;
+  renderFocusTimer();
 }
 
 function renderNotificationStatus() {
@@ -601,7 +1118,7 @@ function renderNotificationStatus() {
     status.textContent = "此瀏覽器不支援通知";
     button.disabled = true;
   } else if (Notification.permission === "granted") {
-    status.textContent = `每日 ${state.packingTime} 提醒準備明天的課本`;
+    status.textContent = `每日 ${state.packingTime} 提醒準備下一個上課日`;
     button.textContent = "通知已啟用";
     button.disabled = true;
   } else if (Notification.permission === "denied") {
@@ -609,7 +1126,7 @@ function renderNotificationStatus() {
     button.textContent = "通知已封鎖";
     button.disabled = true;
   } else {
-    status.textContent = `每日 ${state.packingTime} 提醒準備明天的課本`;
+    status.textContent = `每日 ${state.packingTime} 提醒準備下一個上課日`;
     button.textContent = "啟用提醒";
     button.disabled = false;
   }
@@ -636,13 +1153,13 @@ async function checkPackingReminder() {
   if (now.toTimeString().slice(0, 5) < state.packingTime) return;
   const today = localDateString(now);
   if (state.lastReminderDate === today) return;
-  const { books } = packingBooks(1);
+  const { books } = packingBooks(nextSchoolDayOffset(now));
   const pendingStudy = state.tasks
     .filter((task) => !taskCompleted(task))
     .slice(0, 3)
     .map((task) => task.title);
   const reminderParts = [];
-  if (books.length) reminderParts.push(`明天帶：${books.slice(0, 5).join("、")}${books.length > 5 ? "…" : ""}`);
+  if (books.length) reminderParts.push(`下一個上課日帶：${books.slice(0, 5).join("、")}${books.length > 5 ? "…" : ""}`);
   if (pendingStudy.length) reminderParts.push(`待讀：${pendingStudy.join("、")}`);
   const body = reminderParts.join("；") || "明天課表尚未安排，請先確認課程。";
   try {
@@ -821,6 +1338,66 @@ function imageToDataUrl(file) {
   });
 }
 
+function isHttpImageUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch (error) {
+    return false;
+  }
+}
+
+function renderExamCoverPreview(source) {
+  const preview = document.querySelector("#task-cover-preview");
+  const image = document.querySelector("#task-cover-preview-image");
+  if (!source) {
+    image.removeAttribute("src");
+    preview.classList.add("hidden");
+    return;
+  }
+  image.onerror = () => {
+    preview.classList.add("hidden");
+    showToast("封面圖片無法載入，請檢查網址或重新上傳。");
+  };
+  image.onload = () => preview.classList.remove("hidden");
+  image.src = source;
+}
+
+async function compressExamCover(file) {
+  if (typeof createImageBitmap !== "function") throw new Error("此瀏覽器不支援圖片壓縮。");
+  const bitmap = await createImageBitmap(file);
+  try {
+    if (!bitmap.width || !bitmap.height) throw new Error("圖片尺寸無效。");
+    let scale = Math.min(1, 1400 / Math.max(bitmap.width, bitmap.height));
+    for (let attempt = 0; attempt < 9; attempt += 1) {
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+      canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("無法建立圖片壓縮畫布。");
+      context.fillStyle = "#fff";
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      const quality = Math.max(0.46, 0.82 - attempt * 0.045);
+      const blob = await new Promise((resolve, reject) => {
+        canvas.toBlob((result) => {
+          if (result) resolve(result);
+          else reject(new Error("圖片壓縮失敗。"));
+        }, "image/jpeg", quality);
+      });
+      if (blob.size <= maxExamCoverBlobSize) {
+        const dataUrl = await imageToDataUrl(blob);
+        if (dataUrl.length > maxExamCoverDataSize) throw new Error("封面圖片仍過大，請改用較小的圖片。");
+        return dataUrl;
+      }
+      scale *= 0.84;
+    }
+    throw new Error("圖片無法壓縮至同步容量內，請改用較小圖片。");
+  } finally {
+    bitmap.close();
+  }
+}
+
 function parseTimetableResponse(text) {
   const cleaned = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
   let parsed;
@@ -964,29 +1541,63 @@ document.querySelector("#open-task-modal").addEventListener("click", () => openT
 document.querySelector("#close-task-modal").addEventListener("click", closeTaskDialog);
 document.querySelector("#cancel-task-modal").addEventListener("click", closeTaskDialog);
 document.querySelector("#task-type").addEventListener("change", updateTaskFields);
+document.querySelector("#task-deadline-tbd").addEventListener("change", updateTaskFields);
+document.querySelector("#task-practice-mode-field").addEventListener("change", updateTaskFields);
 document.querySelector("#task-dialog").addEventListener("click", (event) => {
-  if (event.target === event.currentTarget) closeTaskDialog();
+  if (event.target === event.currentTarget && !examCoverCompressionInProgress) closeTaskDialog();
+});
+document.querySelector("#task-dialog").addEventListener("cancel", (event) => {
+  if (examCoverCompressionInProgress) event.preventDefault();
 });
 
 document.querySelector("#task-form").addEventListener("submit", (event) => {
   event.preventDefault();
+  if (examCoverCompressionInProgress) {
+    showToast("封面圖片正在壓縮，請稍候再儲存。");
+    return;
+  }
   const data = new FormData(event.currentTarget);
   const id = String(data.get("id") || "");
   const type = String(data.get("type"));
   const title = String(data.get("title") || "").trim();
   if (!title) return;
+  const practiceMode = type === "practice" && data.get("practiceMode") === "one-time" ? "one-time" : "daily";
+  const deadlineTbd = type === "practice" && practiceMode === "daily" ? false : Boolean(data.get("deadlineTbd"));
+  const date = deadlineTbd || type === "practice" && practiceMode === "daily" ? "" : String(data.get("date") || "");
+  const endDate = type === "exam" && !deadlineTbd ? String(data.get("endDate") || "") : "";
+  if (endDate && date && endDate < date) {
+    showToast("結束日期不可早於考試開始日期。");
+    return;
+  }
+  const coverUrl = type === "exam" ? document.querySelector("#task-cover-url").value.trim() : "";
+  if (coverUrl && !isHttpImageUrl(coverUrl)) {
+    showToast("封面網址僅支援 http 或 https。");
+    return;
+  }
+  const coverImage = type === "exam" ? coverUrl || taskEditorCoverImage : "";
   const existing = state.tasks.find((task) => task.id === id);
+  const samePracticeMode = existing?.type === "practice" && existing.practiceMode === practiceMode;
   const task = {
     id: id || (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`),
     type,
     title,
     subject: String(data.get("subject") || "").trim(),
     scope: type === "exam" ? String(data.get("scope") || "").trim() : "",
-    date: type === "practice" ? "" : String(data.get("date") || ""),
-    time: type === "homework" ? String(data.get("time") || "") : "",
+    date,
+    endDate,
+    coverImage,
+    deadlineTbd,
+    time: type === "homework" ? String(data.get("time") || "").trim() : "",
     goal: type === "practice" ? String(data.get("goal") || "").trim() : "",
-    completed: existing && existing.type !== "practice" ? existing.completed : false,
-    completedOn: existing && type === "practice" ? existing.completedOn : ""
+    notes: String(data.get("notes") || "").trim(),
+    priority: ["high", "normal", "low"].includes(data.get("priority")) ? String(data.get("priority")) : "normal",
+    practiceMode: type === "practice" ? practiceMode : "",
+    completed: type === "practice"
+      ? practiceMode === "one-time" && samePracticeMode ? Boolean(existing.completed) : false
+      : existing && existing.type !== "practice" ? Boolean(existing.completed) : false,
+    completedOn: type === "practice" && practiceMode === "daily" && samePracticeMode ? existing.completedOn : "",
+    lastCompletedDate: type === "practice" && practiceMode === "daily" && samePracticeMode ? existing.lastCompletedDate : "",
+    streak: type === "practice" && practiceMode === "daily" && samePracticeMode ? existing.streak : 0
   };
   if (existing) Object.assign(existing, task);
   else state.tasks.push(task);
@@ -995,6 +1606,76 @@ document.querySelector("#task-form").addEventListener("submit", (event) => {
   renderBindings();
   closeTaskDialog();
   showToast(existing ? "項目已更新。" : "項目已新增。");
+});
+
+document.querySelector("#task-cover-url").addEventListener("input", (event) => {
+  const value = event.currentTarget.value.trim();
+  taskEditorCoverImage = "";
+  renderExamCoverPreview(value && isHttpImageUrl(value) ? value : "");
+});
+document.querySelector("#task-cover-file").addEventListener("change", async (event) => {
+  const input = event.currentTarget;
+  const file = input.files?.[0];
+  if (!file) return;
+  const submitButton = document.querySelector("#task-form button[type='submit']");
+  const coverControls = [
+    document.querySelector("#close-task-modal"),
+    document.querySelector("#cancel-task-modal"),
+    document.querySelector("#task-cover-url"),
+    document.querySelector("#task-cover-remove"),
+    input
+  ];
+  examCoverCompressionInProgress = true;
+  submitButton.disabled = true;
+  coverControls.forEach((control) => { control.disabled = true; });
+  try {
+    if (!file.type.startsWith("image/")) throw new Error("請選擇圖片檔案。");
+    if (file.size > maxExamCoverFileSize) throw new Error("原始圖片不可大於 20 MB。");
+    const coverImage = await compressExamCover(file);
+    const currentTaskId = document.querySelector("#task-id").value;
+    const otherCoversSize = state.tasks.reduce((total, task) => {
+      if (task.id === currentTaskId || !task.coverImage.startsWith("data:image/")) return total;
+      return total + task.coverImage.length;
+    }, 0);
+    if (otherCoversSize + coverImage.length > maxTotalExamCoverDataSize) {
+      throw new Error("已超過考試封面同步容量，請先移除其他封面圖片。");
+    }
+    taskEditorCoverImage = coverImage;
+    document.querySelector("#task-cover-url").value = "";
+    renderExamCoverPreview(coverImage);
+    showToast("封面圖片已壓縮完成。");
+  } catch (error) {
+    console.error("考試封面處理失敗：", error);
+    showToast(error.message || "封面圖片處理失敗。");
+  } finally {
+    examCoverCompressionInProgress = false;
+    submitButton.disabled = false;
+    coverControls.forEach((control) => { control.disabled = false; });
+    input.value = "";
+  }
+});
+document.querySelector("#task-cover-remove").addEventListener("click", () => {
+  taskEditorCoverImage = "";
+  document.querySelector("#task-cover-url").value = "";
+  document.querySelector("#task-cover-file").value = "";
+  renderExamCoverPreview("");
+});
+document.querySelector("#exam-list").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-exam-image-id]");
+  if (!button) return;
+  const task = state.tasks.find((item) => item.id === button.dataset.examImageId);
+  if (!task || !task.coverImage) return;
+  document.querySelector("#exam-image-title").textContent = task.title;
+  const image = document.querySelector("#exam-image-large");
+  image.src = task.coverImage;
+  image.alt = `${task.title} 考試封面`;
+  document.querySelector("#exam-image-dialog").showModal();
+});
+document.querySelector("#close-exam-image").addEventListener("click", () => {
+  document.querySelector("#exam-image-dialog").close();
+});
+document.querySelector("#exam-image-dialog").addEventListener("click", (event) => {
+  if (event.target === event.currentTarget) event.currentTarget.close();
 });
 
 document.querySelector("#dashboard").addEventListener("click", (event) => {
@@ -1019,7 +1700,29 @@ document.querySelector("#dashboard").addEventListener("change", (event) => {
   const task = state.tasks.find((item) => item.id === checkbox.dataset.taskId);
   if (!task) return;
   if (task.type === "practice") {
-    task.completedOn = checkbox.checked ? localDateString(new Date()) : "";
+    if (task.practiceMode === "one-time") {
+      task.completed = checkbox.checked;
+    } else {
+      const today = localDateString(new Date());
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      const yesterdayString = localDateString(yesterday);
+      if (checkbox.checked) {
+        task.streak = task.lastCompletedDate === yesterdayString ? task.streak + 1 : 1;
+        task.lastCompletedDate = today;
+        task.completedOn = today;
+      } else if (task.lastCompletedDate === today) {
+        if (task.streak > 1) {
+          task.lastCompletedDate = yesterdayString;
+          task.streak -= 1;
+          task.completedOn = yesterdayString;
+        } else {
+          task.lastCompletedDate = "";
+          task.streak = 0;
+          task.completedOn = "";
+        }
+      }
+    }
   } else {
     task.completed = checkbox.checked;
   }
@@ -1069,12 +1772,53 @@ document.querySelector("#timetable-body").addEventListener("input", (event) => {
   saveState();
 });
 
-document.querySelector("#binding-grid").addEventListener("change", (event) => {
-  const input = event.target.closest("[data-subject]");
-  if (!input) return;
-  state.bindings[input.dataset.subject] = input.value.split(/[,，、]/).map((book) => book.trim()).filter(Boolean);
-  renderPacking();
-  saveState();
+document.querySelector("#binding-grid").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-subject-action]");
+  if (!button) return;
+  const subject = button.dataset.subject;
+  const row = button.closest(".binding-card");
+  const action = button.dataset.subjectAction;
+  if (action === "rename") {
+    const editor = row.querySelector(".subject-rename");
+    editor.classList.remove("hidden");
+    const input = editor.querySelector(".subject-rename-input");
+    input.focus();
+    input.select();
+  } else if (action === "cancel-name") {
+    row.querySelector(".subject-rename").classList.add("hidden");
+  } else if (action === "save-name") {
+    renameSubject(subject, row.querySelector(".subject-rename-input").value);
+  } else if (action === "delete") {
+    deleteSubject(subject);
+  } else if (action === "add-book") {
+    const input = row.querySelector(".binding-add-input");
+    const book = input.value.trim();
+    if (!book) return;
+    const books = Array.isArray(state.bindings[subject]) ? [...state.bindings[subject]] : [];
+    if (books.includes(book)) {
+      showToast("這本講義已存在。");
+      return;
+    }
+    books.push(book);
+    state.bindings[subject] = books;
+    renderBindings();
+    renderPacking();
+    saveState();
+  } else {
+    const books = Array.isArray(state.bindings[subject]) ? [...state.bindings[subject]] : [];
+    const index = Number(button.dataset.bookIndex);
+    if (action === "remove-book") {
+      books.splice(index, 1);
+    } else {
+      const target = action === "move-book-up" ? index - 1 : index + 1;
+      if (target < 0 || target >= books.length) return;
+      [books[index], books[target]] = [books[target], books[index]];
+    }
+    state.bindings[subject] = books;
+    renderBindings();
+    renderPacking();
+    saveState();
+  }
 });
 
 document.querySelector("#subject-form").addEventListener("submit", (event) => {
@@ -1086,6 +1830,7 @@ document.querySelector("#subject-form").addEventListener("submit", (event) => {
     showToast("科目已存在。");
     return;
   }
+  state.deletedSubjects = state.deletedSubjects.filter((item) => item !== subject);
   state.bindings[subject] = [];
   input.value = "";
   renderBindings();
@@ -1097,22 +1842,38 @@ document.querySelector("#timetable-image").addEventListener("change", (event) =>
   if (file) scanTimetable(file);
 });
 
-document.querySelectorAll("[data-pack-day]").forEach((button) => {
-  button.addEventListener("click", () => {
-    selectedPackingDay = button.dataset.packDay;
-    document.querySelectorAll("[data-pack-day]").forEach((item) => {
-      item.classList.toggle("is-selected", item === button);
-    });
-    renderPacking();
-  });
-});
-
 document.querySelector("#packing-list").addEventListener("change", (event) => {
   const checkbox = event.target.closest("[data-pack-key]");
   if (!checkbox) return;
   state.packingChecked[checkbox.dataset.packKey] = checkbox.checked;
   saveState();
 });
+
+document.querySelector("#reset-packing").addEventListener("click", () => {
+  const date = new Date();
+  date.setDate(date.getDate() + nextSchoolDayOffset(date));
+  const prefix = `${localDateString(date)}|`;
+  Object.keys(state.packingChecked).forEach((key) => {
+    if (key.startsWith(prefix)) delete state.packingChecked[key];
+  });
+  renderPacking();
+  saveState();
+  showToast("明日書包勾選已重置。");
+});
+
+document.querySelectorAll("[data-focus-minutes]").forEach((button) => {
+  button.addEventListener("click", () => setFocusDuration(Number(button.dataset.focusMinutes)));
+});
+document.querySelector("#focus-set-custom").addEventListener("click", () => {
+  const minutes = Number(document.querySelector("#focus-custom-minutes").value);
+  if (!Number.isInteger(minutes)) {
+    showToast("請輸入自訂專注分鐘數。");
+    return;
+  }
+  setFocusDuration(minutes);
+});
+document.querySelector("#focus-start").addEventListener("click", toggleFocusTimer);
+document.querySelector("#focus-reset").addEventListener("click", resetFocusTimer);
 
 document.querySelector("#packing-time").addEventListener("change", (event) => {
   state.packingTime = event.currentTarget.value || "21:30";
@@ -1298,6 +2059,7 @@ renderNotificationStatus();
 renderAiConfig();
 renderChat();
 renderSyncSettings();
+renderFocusTimer();
 document.querySelector("#packing-time").value = state.packingTime;
 if (syncSettings.token && syncSettings.gistId) runSync(pullFromGist);
 
@@ -1306,8 +2068,15 @@ window.setInterval(() => {
   const date = localDateString(new Date());
   if (date === activeDate) return;
   activeDate = date;
+  if (resetExpiredPracticeStreaks(date)) saveState();
   renderDate();
   renderTasks();
+  if (state.focusDate !== date) {
+    state.focusDate = date;
+    state.focusMinutes = 0;
+    saveState();
+  }
+  renderFocusTimer();
   renderPacking();
 }, 30 * 1000);
 
